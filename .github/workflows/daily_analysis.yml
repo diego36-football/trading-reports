@@ -1,0 +1,127 @@
+name: Daily Market Analysis
+
+on:
+  schedule:
+    - cron: '0 7 * * 1-5'   # 평일 오전 7시 UTC = 한국시간 오후 4시
+  workflow_dispatch:           # 수동 실행 버튼
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create reports directory
+        run: mkdir -p reports/${{ env.TODAY }}
+        env:
+          TODAY: ${{ steps.date.outputs.date }}
+
+      - name: Get today's date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Run Macro Regime Detector
+        id: macro
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: |
+          cd macro-regime-detector-scripts
+          python macro_regime_detector.py \
+            --api-key "$FMP_API_KEY" \
+            --output-dir ../reports/${{ steps.date.outputs.date }}
+          echo "✓ Macro Regime Detector 완료"
+
+      - name: Run Market Top Detector
+        id: market_top
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: |
+          cd market-top-detector-scripts
+          python market_top_detector.py \
+            --api-key "$FMP_API_KEY" \
+            --output-dir ../reports/${{ steps.date.outputs.date }}
+          echo "✓ Market Top Detector 완료"
+
+      - name: Extract report summaries
+        id: summary
+        run: |
+          DATE=${{ steps.date.outputs.date }}
+
+          # Macro Regime 요약 추출
+          MACRO_FILE=$(ls reports/$DATE/macro_regime_*.md 2>/dev/null | head -1)
+          if [ -f "$MACRO_FILE" ]; then
+            MACRO_SUMMARY=$(grep -A 3 "## Current Regime\|## Regime\|Regime:" "$MACRO_FILE" | head -5 | tr '\n' ' ' | cut -c1-200)
+          else
+            MACRO_SUMMARY="파일 생성 실패"
+          fi
+
+          # Market Top 요약 추출
+          TOP_FILE=$(ls reports/$DATE/market_top_*.md 2>/dev/null | head -1)
+          if [ -f "$TOP_FILE" ]; then
+            TOP_SUMMARY=$(grep -A 3 "## Overall\|Composite Score\|Risk Zone\|Score:" "$TOP_FILE" | head -5 | tr '\n' ' ' | cut -c1-200)
+          else
+            TOP_SUMMARY="파일 생성 실패"
+          fi
+
+          echo "macro_summary=$MACRO_SUMMARY" >> $GITHUB_OUTPUT
+          echo "top_summary=$TOP_SUMMARY" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          DATE=${{ steps.date.outputs.date }}
+          MACRO_STATUS=${{ steps.macro.outcome }}
+          TOP_STATUS=${{ steps.market_top.outcome }}
+
+          MACRO_ICON=$([ "$MACRO_STATUS" = "success" ] && echo "✅" || echo "❌")
+          TOP_ICON=$([ "$TOP_STATUS" = "success" ] && echo "✅" || echo "❌")
+
+          REPO_URL="https://github.com/${{ github.repository }}/tree/main/reports/$DATE"
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": {\"type\": \"plain_text\", \"text\": \"📊 일일 시장 분석 보고서 - $DATE\"}
+                },
+                {
+                  \"type\": \"section\",
+                  \"fields\": [
+                    {\"type\": \"mrkdwn\", \"text\": \"$MACRO_ICON *Macro Regime Detector*\n${{ steps.summary.outputs.macro_summary }}\"},
+                    {\"type\": \"mrkdwn\", \"text\": \"$TOP_ICON *Market Top Detector*\n${{ steps.summary.outputs.top_summary }}\"}
+                  ]
+                },
+                {
+                  \"type\": \"actions\",
+                  \"elements\": [{
+                    \"type\": \"button\",
+                    \"text\": {\"type\": \"plain_text\", \"text\": \"전체 보고서 보기\"},
+                    \"url\": \"$REPO_URL\"
+                  }]
+                }
+              ]
+            }"
+
+      - name: Commit reports to repository
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          git diff --staged --quiet || git commit -m "📊 Daily analysis - ${{ steps.date.outputs.date }}"
+          git push
